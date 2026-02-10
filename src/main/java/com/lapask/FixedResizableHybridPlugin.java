@@ -21,6 +21,7 @@ import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetPositionMode;
 import net.runelite.api.widgets.WidgetSizeMode;
@@ -77,6 +78,11 @@ public class FixedResizableHybridPlugin extends Plugin
 	private boolean transparentChatbox = false;
 	private int wideChatViewportOffset = 23; //height of the buttons at the bottom of the chatbox
 	private List<Integer> widgetsToFixBeforeRender = new ArrayList<Integer>();
+
+	// Bank expansion state tracking (driven by onScriptPostFired to avoid onBeforeRender FPS impact)
+	private boolean bankExpanded = false;
+	private boolean needBankExpansionUpdate = false;
+
 	private static final Set<Integer> WIDGETS_WITH_BACKGROUNDS = Set.of(
 		398, // Fairy ring
 		416,  // Canoe interface (choose canoe)
@@ -224,6 +230,10 @@ public class FixedResizableHybridPlugin extends Plugin
 		{
 			case 909: // Interface boxes recalculated (e.g., bank inventory, settings panel, etc)
 				//log.debug("script 909: fixInterfaceDimensions()");
+				if (config.expandBankInterface())
+				{
+					handleBankExpansion();
+				}
 				fixInterfaceDimensions();
 				break;
 			case 654: // Stats guide widget opened (osb>214.0>214.1)
@@ -267,6 +277,10 @@ public class FixedResizableHybridPlugin extends Plugin
 			case ScriptID.MESSAGE_LAYER_OPEN:
 			case ScriptID.MESSAGE_LAYER_CLOSE: //cases 113 and 664 removed d/t redundancy
 				// Chatbox opens/closes
+				if (config.expandBankInterface() && (bankExpanded || needBankExpansionUpdate))
+				{
+					handleBankExpansion();
+				}
 				if (config.isWideChatbox())
 				{
 					//log.debug("script 175/178/messagelayeropen/close, chatboxChanged() and widenChat()");
@@ -281,6 +295,10 @@ public class FixedResizableHybridPlugin extends Plugin
 			case 4731:
 				// TOB widget fix (party orbs flicker if omitted)
 				fixIngameOverlayWidgets();
+				if (config.expandBankInterface() && bankExpanded)
+				{
+					fixInterfaceDimensions();
+				}
 				break;
 			default:
 				break;
@@ -348,6 +366,12 @@ public class FixedResizableHybridPlugin extends Plugin
 		{
 			widgetWithBackgroundLoaded = true;
 			widgetsToFixBeforeRender.add(groupID);
+		}
+		// Bank or seed vault opened - run expansion on next script 909 or chat toggle
+		// Bank group ID = 12 (OSRS), seed vault from InterfaceID
+		if (config.expandBankInterface() && (groupID == 12 || groupID == InterfaceID.SEED_VAULT))
+		{
+			needBankExpansionUpdate = true;
 		}
 	}
 
@@ -656,6 +680,7 @@ public class FixedResizableHybridPlugin extends Plugin
 			Widget osbParent = oldSchoolBox.getParent();
 			int parentHeight = osbParent.getOriginalHeight();
 			int renderViewportHeight = renderViewport.getHeight();
+
 			if (osbParent.getXPositionMode() == 1 || osbParent.getYPositionMode() == 1)
 			{
 				osbParent.setXPositionMode(0);
@@ -663,14 +688,36 @@ public class FixedResizableHybridPlugin extends Plugin
 				osbParent.setOriginalWidth(renderViewport.getWidth());
 				osbParent.revalidateScroll();
 			}
-			if (!config.isWideChatbox() && parentHeight != renderViewportHeight)
+
+			// Collapse chatbox when bank is expanded and chat is closed
+			boolean collapseChatbox = config.expandBankInterface() && bankExpanded && !isChatboxOpen();
+
+			if (!config.isWideChatbox())
 			{
 				osbParent.setOriginalHeight(renderViewportHeight);
 				osbParent.revalidateScroll();
+
+				if (collapseChatbox)
+				{
+					oldSchoolBox.setOriginalHeight(BankExpansionConstants.CHATBOX_BUTTON_HEIGHT);
+					oldSchoolBox.revalidateScroll();
+				}
+				else if (oldSchoolBox.getOriginalHeight() != 165)
+				{
+					oldSchoolBox.setOriginalHeight(165);
+					oldSchoolBox.revalidateScroll();
+				}
 			}
 			else if (config.isWideChatbox())
 			{
-				if (isChatboxOpen() && config.chatboxViewportCentering() && !transparentChatbox)
+				if (collapseChatbox)
+				{
+					osbParent.setOriginalHeight(renderViewportHeight);
+					osbParent.revalidateScroll();
+					oldSchoolBox.setOriginalHeight(BankExpansionConstants.CHATBOX_BUTTON_HEIGHT);
+					oldSchoolBox.revalidateScroll();
+				}
+				else if (isChatboxOpen() && config.chatboxViewportCentering() && !transparentChatbox)
 				{
 					osbParent.setOriginalHeight(renderViewportHeight);
 					osbParent.revalidateScroll();
@@ -1605,5 +1652,92 @@ public class FixedResizableHybridPlugin extends Plugin
 				&& !chatboxFrame.isHidden();
 		}
 		return !chatboxFrame.isHidden();
+	}
+
+	// ============================
+	// Bank Expansion Methods (driven by onScriptPostFired to limit FPS impact)
+	// ============================
+
+	/**
+	 * Positions a widget at specific coordinates
+	 */
+	private void positionWidget(Widget widget, int x, int y)
+	{
+		if (widget == null)
+		{
+			return;
+		}
+		widget.setOriginalX(x);
+		widget.setOriginalY(y);
+		widget.setXPositionMode(WidgetPositionMode.ABSOLUTE_LEFT);
+		widget.setYPositionMode(WidgetPositionMode.ABSOLUTE_TOP);
+		widget.revalidateScroll();
+	}
+
+	/**
+	 * Handles bank expansion logic - called from onScriptPostFired (script 909, chat toggle)
+	 * and when bank/seed vault widget loads, to avoid running every frame in onBeforeRender.
+	 */
+	private void handleBankExpansion()
+	{
+		if (!widgetsModified || getGameClientLayout() != 2 || !config.expandBankInterface())
+		{
+			bankExpanded = false;
+			needBankExpansionUpdate = false;
+			return;
+		}
+
+		final Widget bankWidget = client.getWidget(ComponentID.BANK_CONTAINER);
+		final Widget seedVaultWidget = client.getWidget(InterfaceID.SEED_VAULT, 1);
+
+		boolean bankOpen = (bankWidget != null && !bankWidget.isSelfHidden());
+		boolean seedVaultOpen = (seedVaultWidget != null && !seedVaultWidget.isSelfHidden());
+
+		if (!bankOpen && !seedVaultOpen)
+		{
+			if (bankExpanded)
+			{
+				bankExpanded = false;
+				needBankExpansionUpdate = false;
+				fixInterfaceDimensions();
+			}
+			return;
+		}
+
+		needBankExpansionUpdate = false;
+		boolean justExpanded = !bankExpanded;
+		bankExpanded = true;
+
+		final Widget activeWidget = bankOpen ? bankWidget : seedVaultWidget;
+
+		// Reinitialize bank script when first opened to fix tag tabs
+		if (justExpanded && bankOpen && bankWidget != null)
+		{
+			client.createScriptEvent(bankWidget.getOnLoadListener())
+				.setSource(bankWidget)
+				.run();
+		}
+
+		positionWidget(activeWidget, BankExpansionConstants.BANK_X, BankExpansionConstants.BANK_Y);
+
+		// Calculate bank height dynamically based on viewport and chatbox
+		final Widget viewport = client.getWidget(InterfaceID.ToplevelOsrsStretch.VIEWPORT);
+		final Widget hudContainer = client.getWidget(InterfaceID.ToplevelOsrsStretch.HUD_CONTAINER_FRONT);
+
+		if (viewport != null && hudContainer != null && activeWidget != null)
+		{
+			int viewportHeight = viewport.getHeight();
+			int chatboxHeight = hudContainer.getOriginalHeight();
+			int availableHeight = viewportHeight - chatboxHeight - BankExpansionConstants.BANK_Y - 1;
+
+			activeWidget.setOriginalHeight(availableHeight);
+			activeWidget.setHeightMode(WidgetSizeMode.ABSOLUTE);
+			activeWidget.revalidateScroll();
+		}
+
+		if (justExpanded)
+		{
+			fixInterfaceDimensions();
+		}
 	}
 }

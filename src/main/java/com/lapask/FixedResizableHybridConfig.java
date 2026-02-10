@@ -223,4 +223,16 @@ public interface FixedResizableHybridConfig extends Config
 	{
 		return true;
 	}
+
+	@ConfigItem(
+		keyName = "expandBankInterface",
+		name = "Expand Bank Interface",
+		description = "Automatically expands the bank, seed vault, and certain dialog interfaces to fill the full viewport height.",
+		position = 4,
+		section = wideChatboxSettings
+	)
+	default boolean expandBankInterface()
+	{
+		return true;
+	}
 }
